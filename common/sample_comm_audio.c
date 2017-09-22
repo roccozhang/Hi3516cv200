@@ -30,6 +30,8 @@ extern "C"{
 #endif /* End of #ifdef __cplusplus */
 
 #define ACODEC_FILE     "/dev/acodec"
+#define MALLOC(pd,type,size) 	(type *)malloc((size));\
+															memset((pd), 0, (size))
 
 #define AUDIO_ADPCM_TYPE ADPCM_TYPE_DVI4/* ADPCM_TYPE_IMA, ADPCM_TYPE_DVI4*/
 #define G726_BPS MEDIA_G726_40K         /* MEDIA_G726_16K, MEDIA_G726_24K ... */
@@ -72,10 +74,28 @@ typedef struct tagSAMPLE_AO_S
 	pthread_t stAoPid;
 }SAMPLE_AO_S;
 
+
+
 static SAMPLE_AI_S gs_stSampleAi[AI_DEV_MAX_NUM*AIO_MAX_CHN_NUM];
 static SAMPLE_AENC_S gs_stSampleAenc[AENC_MAX_CHN_NUM];
 static SAMPLE_ADEC_S gs_stSampleAdec[ADEC_MAX_CHN_NUM];
 static SAMPLE_AO_S   gs_stSampleAo[AO_DEV_MAX_NUM];
+
+extern short * pdatabuffer[7];
+struct cache
+{
+	short data[640];
+	HI_U32 len;
+	int state;
+	int sign;
+	long energy;
+	long variance;
+	short vpp;
+};
+#define CACHESIZE 30000
+extern struct cache audiocache[CACHESIZE];
+extern int head;
+extern int tail;
 
 #ifdef HI_ACODEC_TYPE_TLV320AIC31
 HI_S32 SAMPLE_Tlv320_CfgAudio(AIO_MODE_E enWorkmode, AUDIO_SAMPLE_RATE_E enSample)
@@ -436,7 +456,128 @@ HI_S32 SAMPLE_COMM_AUDIO_CfgAcodec(AIO_ATTR_S *pstAioAttr)
     }
     return HI_SUCCESS;
 }
+/******************************************************************************
+* function : get frame from Ai, send it  to Aenc or Ao
+******************************************************************************/
+void *MY_COMM_AUDIO_AiProc(void *parg)
+{
+    HI_S32 s32Ret;
+    HI_S32 AiFd;
+    SAMPLE_AI_S *pstAiCtl = (SAMPLE_AI_S *)parg;
+    AUDIO_FRAME_S stFrame;
+		AEC_FRAME_S   stAecFrm;
+    fd_set read_fds;
+    struct timeval TimeoutVal;
+    AI_CHN_PARAM_S stAiChnPara;
+		s32Ret = HI_MPI_AI_GetChnParam(pstAiCtl->AiDev, pstAiCtl->AiChn, &stAiChnPara);
+    if (HI_SUCCESS != s32Ret)
+    {
+        printf("%s: Get ai chn param failed\n", __FUNCTION__);
+        return NULL;
+    }
+    
+    stAiChnPara.u32UsrFrmDepth = 30;
+    
+    s32Ret = HI_MPI_AI_SetChnParam(pstAiCtl->AiDev, pstAiCtl->AiChn, &stAiChnPara);
+    if (HI_SUCCESS != s32Ret)
+    {
+        printf("%s: set ai chn param failed:%x\n", __FUNCTION__,s32Ret);
+        return NULL;
+    }
+    
+    FD_ZERO(&read_fds);
+    AiFd = HI_MPI_AI_GetFd(pstAiCtl->AiDev, pstAiCtl->AiChn);
+    FD_SET(AiFd,&read_fds);
 
+
+
+    while (pstAiCtl->bStart)
+    {
+        TimeoutVal.tv_sec = 1;
+        TimeoutVal.tv_usec = 0;
+        
+        FD_ZERO(&read_fds);
+        FD_SET(AiFd,&read_fds);
+        
+        s32Ret = select(AiFd+1, &read_fds, NULL, NULL, &TimeoutVal);
+        if (s32Ret < 0) 
+        {
+            break;
+        }
+        else if (0 == s32Ret) 
+        {
+            printf("%s: get ai frame select time out\n", __FUNCTION__);
+            break;
+        }        
+        
+        if (FD_ISSET(AiFd, &read_fds))
+        {
+            /* get frame from ai chn */
+						memset(&stAecFrm, 0, sizeof(AEC_FRAME_S));
+            s32Ret = HI_MPI_AI_GetFrame(pstAiCtl->AiDev, pstAiCtl->AiChn, &stFrame, &stAecFrm, HI_FALSE);
+            if (HI_SUCCESS != s32Ret )
+            {
+            	#if 0
+                printf("%s: HI_MPI_AI_GetFrame(%d, %d), failed with %#x!\n",\
+                       __FUNCTION__, pstAiCtl->AiDev, pstAiCtl->AiChn, s32Ret);
+                pstAiCtl->bStart = HI_FALSE;
+                return NULL;
+		#else
+		continue;
+		#endif
+            }
+/******************************************************************************
+* block : get audio data and save to buffer 'audiocache'
+******************************************************************************/            
+		/*printf("||:seach\n");*/
+		memset(audiocache[tail].data, 0, stFrame.u32Len);
+		audiocache[tail].len = stFrame.u32Len;
+		audiocache[tail].state = 1;
+		/*printf("||:write audiocache[tail] %d %d %d %d %d\n", &(audiocache[tail]), audiocache[tail].data , tail, stFrame.u32Len, &(audiocache[tail].data));*/
+		memcpy(audiocache[tail].data, stFrame.pVirAddr[0], stFrame.u32Len);
+		/*if((tail + 1)%CACHESIZE == 0) printf(". \n");*/
+		fflush(stdout);
+		tail = (tail + 1)%CACHESIZE;
+		/*printf("||:move %d\n", tail);*/
+/******************************************************************************
+* block end;
+******************************************************************************/            
+            /* finally you must release the stream */
+            s32Ret = HI_MPI_AI_ReleaseFrame(pstAiCtl->AiDev, pstAiCtl->AiChn, &stFrame, &stAecFrm);
+            if (HI_SUCCESS != s32Ret )
+            {
+                printf("%s: HI_MPI_AI_ReleaseFrame(%d, %d), failed with %#x!\n",\
+                       __FUNCTION__, pstAiCtl->AiDev, pstAiCtl->AiChn, s32Ret);
+                pstAiCtl->bStart = HI_FALSE;
+                return NULL;
+            }
+            
+        }
+    }
+    
+    pstAiCtl->bStart = HI_FALSE;
+    return NULL;
+}
+
+
+/******************************************************************************
+* function : Create the thread to get frame from ai and send to aenc
+******************************************************************************/
+HI_S32 MY_COMM_AUDIO_CreatTrd(AUDIO_DEV AiDev, AI_CHN AiChn)
+{
+    SAMPLE_AI_S *pstAi = NULL;
+    
+    pstAi = &gs_stSampleAi[AiDev*AIO_MAX_CHN_NUM + AiChn];
+    pstAi->bSendAenc = HI_TRUE;
+    pstAi->bSendAo = HI_FALSE;
+    pstAi->bStart= HI_TRUE;
+    pstAi->AiDev = AiDev;
+    pstAi->AiChn = AiChn;
+    pthread_create(&pstAi->stAiPid, 0, MY_COMM_AUDIO_AiProc, pstAi);
+    printf("create thread to get frame\n");
+    
+    return HI_SUCCESS;
+}
 /******************************************************************************
 * function : get frame from Ai, send it  to Aenc or Ao
 ******************************************************************************/
@@ -493,7 +634,7 @@ void *SAMPLE_COMM_AUDIO_AiProc(void *parg)
         if (FD_ISSET(AiFd, &read_fds))
         {
             /* get frame from ai chn */
-			memset(&stAecFrm, 0, sizeof(AEC_FRAME_S));
+						memset(&stAecFrm, 0, sizeof(AEC_FRAME_S));
             s32Ret = HI_MPI_AI_GetFrame(pstAiCtl->AiDev, pstAiCtl->AiChn, &stFrame, &stAecFrm, HI_FALSE);
             if (HI_SUCCESS != s32Ret )
             {
@@ -502,9 +643,9 @@ void *SAMPLE_COMM_AUDIO_AiProc(void *parg)
                        __FUNCTION__, pstAiCtl->AiDev, pstAiCtl->AiChn, s32Ret);
                 pstAiCtl->bStart = HI_FALSE;
                 return NULL;
-				#else
-				continue;
-				#endif
+							#else
+							continue;
+							#endif
             }
 
             /* send frame to encoder */
@@ -531,7 +672,6 @@ void *SAMPLE_COMM_AUDIO_AiProc(void *parg)
                     pstAiCtl->bStart = HI_FALSE;
                     return NULL;
                 }
-                
             }
 
             /* finally you must release the stream */
@@ -556,6 +696,8 @@ void *SAMPLE_COMM_AUDIO_AiProc(void *parg)
 ******************************************************************************/
 void *SAMPLE_COMM_AUDIO_AencProc(void *parg)
 {
+    int pipe_fd;
+    int res;
     HI_S32 s32Ret;
     HI_S32 AencFd;
     SAMPLE_AENC_S *pstAencCtl = (SAMPLE_AENC_S *)parg;
@@ -567,6 +709,18 @@ void *SAMPLE_COMM_AUDIO_AencProc(void *parg)
     AencFd = HI_MPI_AENC_GetFd(pstAencCtl->AeChn);
     FD_SET(AencFd, &read_fds);
     
+		/*
+		if (access("/tmp/my_fifo", F_OK) == -1)  
+    {  
+        res = mkfifo("/tmp/my_fifo", 0777);  
+        if (res != 0)  
+        {  
+            fprintf(stderr, "Could not create fifo %s\n", "/tmp/my_fifo");  
+        }  
+    }  
+    pipe_fd = open("/tmp/my_fifo", O_WRONLY);
+    */
+   
     while (pstAencCtl->bStart)
     {     
         TimeoutVal.tv_sec = 1;
@@ -612,6 +766,9 @@ void *SAMPLE_COMM_AUDIO_AencProc(void *parg)
             }
             
             /* save audio stream to file */
+            
+            printf("0x%x\t%d\t0x%x\n",stStream.pStream,stStream.u32Len, pstAencCtl->pfd);
+            //res = write(pipe_fd, stStream.pStream, stStream.u32Len);
             fwrite(stStream.pStream,1,stStream.u32Len, pstAencCtl->pfd);
             fflush(pstAencCtl->pfd);
 
